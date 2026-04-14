@@ -14,7 +14,7 @@ Publication:  https://pubmed.ncbi.nlm.nih.gov/25834810/
 Comprehensive Analysis of Transcriptome Sequencing Data in the Lung Tissues of COPD Subjects
 
 Github:  https://github.com/LuckyAllieCat-web/NGS_Group9?tab=readme-ov-file#ngs_group9
-
+Download data:  https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE57148
 Biological Problem:  Unclear mapping of molecular pathways in the COPD dysregulation.  
 
 Experimental Problem:
