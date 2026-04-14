@@ -1,0 +1,1144 @@
+---
+title: "Differential Expression & Gene Set Analysis – COPD (GSE57148)"
+author: "Based on Kim et al., 2015 – Int J Genomics"
+output:
+  html_document:
+    theme: cerulean
+    toc: yes
+    toc_depth: 3
+    number_sections: true
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 9, fig.height = 6,
+                      fig.path = "fig/DGE-", warning = FALSE, message = FALSE)
+```
+
+# Introduction
+
+In this tutorial we identify differentially expressed genes (DEGs) between
+**COPD** and **Control** lung tissue samples (GSE57148, Kim et al. 2015) and
+then perform gene set analysis to identify the biological pathways that are
+dysregulated in COPD.
+
+### Paper strategy
+
+The paper used two approaches:
+
+1. **Differential expression**: Student's *t*-test on FPKM-normalized values
+   (upper-quartile normalized), with FDR correction using the
+   Benjamini–Hochberg algorithm (*q* < 0.01). They identified **2,312 DEGs**.
+
+2. **Gene set analysis**:
+   - **DAVID** (v6.7) — ORA-style functional annotation of DEGs (GO terms)
+   - **GSEA** (v2.0.8) with **MSigDB** (v3.1) — ranked gene-set enrichment
+     using all quantified genes ranked by log fold-change
+   - Key pathways found: **oxidative phosphorylation** (down), **protein
+     catabolism** (down), **chromatin modification** (up)
+
+We reproduce both approaches using modern Bioconductor tools:
+
+- **edgeR GLM** (negative binomial model on raw counts) — more statistically
+  principled than the paper's t-test on normalized values, but we also run the
+  **t-test on FPKM-UQ** to directly mirror the paper
+- **DESeq2** *(new package)* — a second NB-based DE method with a different
+  dispersion shrinkage strategy; used as cross-validation against edgeR
+- **NOISeq** *(new package)* — a non-parametric DE method that makes no
+  distributional assumptions; uniquely suited to detect DE without relying on
+  the NB model
+- **clusterProfiler** for ORA (KEGG, Reactome, GO) — equivalent to DAVID
+- **GSEA** via `clusterProfiler::gseKEGG` / `gseGO` — equivalent to the
+  paper's GSEA with MSigDB
+
+**Files required:**
+
+- `normalization.RData` (output of previous tutorial)
+
+---
+
+## Package installation
+
+```{r, eval=FALSE}
+install.packages(c("ggplot2", "ggrepel", "pheatmap", "cluster"))
+if (!require("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install(c("edgeR", "limma", "EDASeq", "genefilter",
+                       "clusterProfiler", "org.Hs.eg.db", "ReactomePA",
+                       "enrichplot", "pathview", "DESeq2", "NOISeq",
+                       "AnnotationDbi", "ggnewscale", "ggupset", "ggridges"))
+```
+
+## Load packages
+
+```{r, message=FALSE}
+library(edgeR)
+library(limma)
+library(EDASeq)
+library(DESeq2)
+library(NOISeq)
+library(genefilter)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(cluster)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ReactomePA)
+library(enrichplot)
+library(apeglm)
+library(AnnotationDbi)
+library(ggridges)
+library(dplyr)
+```
+
+## Load data from previous tutorial
+
+```{r}
+load("normalization.RData")
+
+# Confirm objects available
+cat("Objects loaded:", paste(ls(), collapse = ", "), "\n")
+cat("raw_count dimensions:", dim(raw_count), "\n")
+cat("Group breakdown:\n")
+print(table(group))
+```
+
+---
+
+# Mean–Variance Relationship
+
+Before running the DE test we examine the mean–variance relationship. In
+RNA-seq data the variance is larger than the mean (**overdispersion**), which
+is why the **Negative Binomial (NB)** distribution is used instead of a
+Poisson model.
+
+$$\text{Var}(Y) = \mu + \phi\mu^2$$
+
+where $\phi$ is the dispersion parameter capturing extra-Poisson variability.
+
+```{r}
+# Design matrix: COPD vs Control
+design <- model.matrix(~ group)
+head(design)
+
+# Build DGEList and compute TMM normalization factors
+dge <- DGEList(counts = raw_count, group = group)
+dge <- calcNormFactors(dge, method = "TMM")
+
+cat("TMM normalization factors (first 6):\n")
+print(round(dge$samples$norm.factors[1:6], 4))
+```
+
+```{r}
+# Estimate dispersions (common → trended → tagwise)
+dge <- estimateDisp(dge, design, robust = TRUE)
+
+cat("Common dispersion:", round(dge$common.dispersion, 4), "\n")
+cat("Biological coefficient of variation (BCV):",
+    round(sqrt(dge$common.dispersion), 4), "\n")
+```
+
+```{r}
+# Mean–variance plot
+plotMeanVar(dge,
+            show.raw.vars     = TRUE,
+            show.ave.raw.vars = FALSE,
+            NBline            = TRUE,
+            show.tagwise.vars = TRUE,
+            main = "Mean–Variance relationship (COPD dataset)")
+```
+
+> Most points lie above the Poisson line (black), confirming overdispersion.
+> The NB line (blue) fits the data much better, justifying the NB model.
+
+```{r}
+# BCV plot — shows per-gene dispersion estimates
+plotBCV(dge, main = "Biological Coefficient of Variation")
+```
+
+---
+
+# Differential Expression Analysis
+
+## Approach 1 — edgeR GLM (NB model on raw counts)
+
+This is the modern recommended approach. edgeR fits a negative-binomial
+generalised linear model and uses a likelihood ratio test (LRT) to identify
+DEGs.
+
+```{r}
+# Fit the GLM
+fit <- glmFit(dge, design)
+
+# Likelihood ratio test: COPD vs Control (coef = 2)
+res <- glmLRT(fit, coef = 2)
+
+# All results table
+tab_edger <- topTags(res, n = Inf)$table
+tab_edger$gene <- rownames(tab_edger)
+
+cat("Total genes tested:", nrow(tab_edger), "\n")
+```
+
+```{r}
+# Apply paper's FDR threshold: q < 0.01
+de_edger <- tab_edger[tab_edger$FDR < 0.01, ]
+cat("DEGs at FDR < 0.01 (edgeR):", nrow(de_edger), "\n")
+cat("  Up-regulated in COPD:", sum(de_edger$logFC > 0), "\n")
+cat("  Down-regulated in COPD:", sum(de_edger$logFC < 0), "\n")
+```
+
+```{r}
+cat("\nTop 20 DEGs by FDR:\n")
+head(tab_edger[order(tab_edger$FDR), ], 20)
+```
+
+## Approach 2 — Student's t-test on FPKM-UQ (paper method)
+
+The paper applied a Student's t-test directly on the FPKM upper-quartile
+normalized values, then corrected for multiple testing with
+Benjamini–Hochberg. We reproduce this to check how closely we can match the
+paper's 2,312 DEGs.
+
+```{r}
+# fpkm_uq was saved in normalization.RData
+# Apply log1p transformation to stabilize variance before t-test
+log_fpkm_uq <- log1p(fpkm_uq)
+
+ctrl_idx <- which(group == "Control")
+copd_idx <- which(group == "COPD")
+
+# Run t-test for each gene
+pvals <- apply(log_fpkm_uq, 1, function(x) {
+  t.test(x[copd_idx], x[ctrl_idx], var.equal = FALSE)$p.value
+})
+
+# Compute log fold-change (mean COPD - mean Control on log scale)
+lfc_ttest <- rowMeans(log_fpkm_uq[, copd_idx]) -
+             rowMeans(log_fpkm_uq[, ctrl_idx])
+
+# Benjamini-Hochberg FDR correction
+qvals <- p.adjust(pvals, method = "BH")
+
+tab_ttest <- data.frame(
+  gene   = rownames(log_fpkm_uq),
+  logFC  = lfc_ttest,
+  PValue = pvals,
+  FDR    = qvals,
+  stringsAsFactors = FALSE
+)
+tab_ttest <- tab_ttest[order(tab_ttest$FDR), ]
+
+de_ttest <- tab_ttest[tab_ttest$FDR < 0.01, ]
+cat("DEGs at FDR < 0.01 (t-test on FPKM-UQ):", nrow(de_ttest), "\n")
+cat("  Paper reported: 2,312 DEGs\n")
+cat("  Up-regulated in COPD:", sum(de_ttest$logFC > 0), "\n")
+cat("  Down-regulated in COPD:", sum(de_ttest$logFC < 0), "\n")
+```
+
+```{r}
+# Overlap between the two methods
+overlap <- intersect(de_edger$gene, de_ttest$gene)
+cat("\nDEGs found by both methods:", length(overlap), "\n")
+cat("DEGs found only by edgeR:", sum(!de_edger$gene %in% de_ttest$gene), "\n")
+cat("DEGs found only by t-test:", sum(!de_ttest$gene %in% de_edger$gene), "\n")
+```
+
+> For downstream gene set analyses we use both lists but focus primarily on
+> the **t-test result** to directly reproduce the paper, and use the **edgeR
+> result** as a modern cross-validation.
+
+---
+
+# DEG Exploration
+
+## MD plot
+
+The MD (Mean–Difference) plot shows log fold-change vs average log expression.
+Red = up-regulated in COPD, blue = down-regulated, black = not significant.
+
+```{r}
+plotMD(res,
+       main = "MD plot – COPD vs Control (edgeR)",
+       status = ifelse(tab_edger$FDR < 0.01,
+                       ifelse(tab_edger$logFC > 0, "Up", "Down"),
+                       "NS"),
+       values = c("Up", "Down", "NS"),
+       col    = c("red", "blue", "grey70"),
+       legend = "topright")
+abline(h = 0, lty = 2, col = "grey40")
+```
+
+## Volcano plot
+
+```{r, fig.width=10, fig.height=8}
+# Safe symbol lookup using the annotation data frame directly
+tab_edger$symbol <- annot_sub$Symbol[match(tab_edger$gene, rownames(raw_count))]
+
+# Replace NA or empty symbols with the Entrez ID so labels are never blank
+tab_edger$symbol[is.na(tab_edger$symbol) | tab_edger$symbol == ""] <- 
+  tab_edger$gene[is.na(tab_edger$symbol) | tab_edger$symbol == ""]
+
+tab_edger$direction <- "NS"
+tab_edger$direction[tab_edger$FDR < 0.01 & tab_edger$logFC > 0] <- "Up (COPD)"
+tab_edger$direction[tab_edger$FDR < 0.01 & tab_edger$logFC < 0] <- "Down (COPD)"
+
+# Top genes to label (by FDR)
+top_label <- head(tab_edger[order(tab_edger$FDR), ], 30)
+
+ggplot(tab_edger, aes(x = logFC, y = -log10(PValue), colour = direction)) +
+  geom_point(size = 0.8, alpha = 0.6) +
+  scale_colour_manual(values = c("Up (COPD)"   = "#E05C5C",
+                                 "Down (COPD)" = "#5B8DB8",
+                                 "NS"          = "grey70")) +
+  geom_text_repel(data = top_label,
+                  aes(label = symbol),
+                  size = 2.5, max.overlaps = 25,
+                  colour = "black") +
+  geom_hline(yintercept = -log10(max(tab_edger$PValue[tab_edger$FDR < 0.01])),
+             lty = 2, colour = "grey40") +
+  geom_vline(xintercept = c(-1, 1), lty = 2, colour = "grey40") +
+  labs(title  = "Volcano plot – COPD vs Control",
+       x      = expression(log[2]~Fold~Change),
+       y      = expression(-log[10]~p-value),
+       colour = "Direction") +
+  theme_classic(base_size = 13)
+```
+
+## P-value distribution
+
+In an unbiased experiment we expect a spike at low p-values mixed with a
+uniform background. A predominantly flat or inverse distribution suggests a
+problematic test; a clean spike indicates genuine signal.
+
+```{r}
+hist(tab_edger$PValue,
+     breaks = 50, col = "#5B8DB8", border = "white",
+     main = "P-value distribution – edgeR (COPD vs Control)",
+     xlab = "p-value")
+```
+
+```{r}
+hist(tab_ttest$PValue,
+     breaks = 50, col = "#E05C5C", border = "white",
+     main = "P-value distribution – t-test on FPKM-UQ (paper method)",
+     xlab = "p-value")
+```
+
+---
+
+# Cluster Analysis
+
+## Heatmap
+
+We select only the DEGs (using the t-test list to match the paper) and
+visualize them on the TMM-normalized matrix. The `scale="row"` option centres
+and scales each gene across samples so that relative expression patterns are
+easy to compare.
+
+```{r, fig.width=12, fig.height=9}
+# Use TMM counts for visualization (robust normalized)
+deg_genes_ttest <- de_ttest$gene
+
+# Subset to DEG genes
+heatmap_mat <- log1p(tmm[rownames(tmm) %in% deg_genes_ttest, ])
+
+# Add gene symbols as row names where available
+sym_map <- annot_sub$symbol[match(rownames(heatmap_mat), rownames(raw_count))]
+rownames(heatmap_mat) <- ifelse(is.na(sym_map) | sym_map == "",
+                                rownames(heatmap_mat), sym_map)
+
+# Column annotation
+col_ann <- data.frame(Group = group)
+rownames(col_ann) <- colnames(heatmap_mat)
+
+ann_colors <- list(Group = c("Control" = "#5B8DB8", "COPD" = "#E05C5C"))
+
+g <- pheatmap(heatmap_mat,
+              show_colnames  = FALSE,
+              show_rownames  = FALSE,
+              scale          = "row",
+              annotation_col = col_ann,
+              annotation_colors = ann_colors,
+              clustering_method = "complete",
+              main = "Heatmap – DEGs (FDR < 0.01, t-test on FPKM-UQ)",
+              silent = TRUE)
+print(g)
+```
+
+## Silhouette index
+
+We cut the sample dendrogram into 2 clusters (COPD and Control) and evaluate
+how well the clustering captures the known biological groups using the
+**silhouette index**.
+
+$$s(i) = \frac{b(i) - a(i)}{\max\{a(i),\, b(i)\}}$$
+
+Values near +1 = well-clustered; near 0 = uncertain; negative = likely
+misclassified.
+
+```{r}
+cut      <- cutree(g$tree_col, k = 2)
+dist_mat <- dist(t(heatmap_mat))
+sil      <- silhouette(cut, dist_mat)
+plot(sil,
+     col    = c("#5B8DB8", "#E05C5C"),
+     border = NA,
+     main   = "Silhouette plot – DEG-based clustering")
+cat("Average silhouette width:", round(mean(sil[, 3]), 3), "\n")
+```
+
+---
+
+# Gene Set Analysis
+
+Gene set analysis answers the question: **which biological processes and
+pathways are enriched among the DEGs?** We use two complementary approaches:
+
+| Approach | Method | Paper equivalent |
+|---|---|---|
+| **ORA** | Fisher exact test on DEG list | DAVID v6.7 |
+| **GSEA** | Ranked enrichment on all genes | GSEA v2.0.8 + MSigDB |
+
+## Prepare gene identifiers
+
+Our row names are **Entrez Gene IDs** — the native format for KEGG, Reactome,
+and GO databases. No ID conversion is needed.
+
+```{r}
+# Universe = all tested genes (Entrez IDs as character)
+universe_entrez <- rownames(tab_ttest)
+
+# Significant DEGs
+sig_entrez <- de_ttest$gene
+
+# Ranked list for GSEA: all genes sorted by logFC (t-test), descending
+ranked_list        <- tab_ttest$logFC
+names(ranked_list) <- tab_ttest$gene
+ranked_list        <- sort(ranked_list[!duplicated(names(ranked_list))],
+                           decreasing = TRUE)
+
+cat("Universe size:", length(universe_entrez), "\n")
+cat("DEG list size:", length(sig_entrez), "\n")
+cat("Ranked list size:", length(ranked_list), "\n")
+```
+
+---
+
+## ORA — Over-Representation Analysis
+
+ORA tests whether a gene set is statistically over-represented in the DEG
+list compared to the universe (all tested genes), using a Fisher exact test.
+
+### GO Biological Process
+
+The paper used DAVID to identify GO terms enriched in the DEGs. The top
+categories reported were:
+
+- **Oxidative phosphorylation** (down)
+- **Protein catabolism / proteasome** (down)
+- **Chromatin modification** (up)
+- **Ribonucleoprotein complex** (up)
+
+```{r}
+ego_BP <- enrichGO(
+  gene          = sig_entrez,
+  universe      = universe_entrez,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH",
+  readable      = TRUE   # converts Entrez IDs to gene symbols in output
+)
+
+cat("Enriched GO-BP terms:", nrow(ego_BP@result[ego_BP@result$p.adjust < 0.05, ]),
+    "\n\n")
+head(ego_BP@result[, 1:7], 15)
+```
+
+```{r, fig.width=12, fig.height=7}
+barplot(ego_BP, showCategory = 20,
+        title = "GO Biological Process – ORA (COPD DEGs)")
+```
+
+```{r, fig.width=12, fig.height=7}
+dotplot(ego_BP, showCategory = 20,
+        title = "GO-BP dotplot")
+```
+
+```{r, fig.width=14, fig.height=8}
+cnetplot(ego_BP, showCategory = 10) +
+  ggtitle("GO-BP network – gene–term connections")
+```
+
+```{r, fig.width=10, fig.height=7}
+ego_BP_sim <- pairwise_termsim(ego_BP)
+emapplot(ego_BP_sim, showCategory = 30) +
+  ggtitle("GO-BP enrichment map – term similarity")
+```
+
+### GO Molecular Function
+
+```{r}
+ego_MF <- enrichGO(
+  gene          = sig_entrez,
+  universe      = universe_entrez,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "MF",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH",
+  readable      = TRUE
+)
+cat("Enriched GO-MF terms:", nrow(ego_MF@result[ego_MF@result$p.adjust < 0.05, ]), "\n")
+```
+
+```{r, fig.width=12, fig.height=7}
+if (nrow(ego_MF@result[ego_MF@result$p.adjust < 0.05, ]) > 0) {
+  barplot(ego_MF, showCategory = 20, title = "GO Molecular Function – ORA")
+}
+```
+
+### GO Cellular Component
+
+```{r}
+ego_CC <- enrichGO(
+  gene          = sig_entrez,
+  universe      = universe_entrez,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "CC",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH",
+  readable      = TRUE
+)
+cat("Enriched GO-CC terms:", nrow(ego_CC@result[ego_CC@result$p.adjust < 0.05, ]), "\n")
+```
+
+```{r, fig.width=12, fig.height=7}
+if (nrow(ego_CC@result[ego_CC@result$p.adjust < 0.05, ]) > 0) {
+  barplot(ego_CC, showCategory = 20, title = "GO Cellular Component – ORA")
+}
+```
+
+### KEGG pathways
+
+```{r}
+kk_ora <- enrichKEGG(
+  gene          = sig_entrez,
+  universe      = universe_entrez,
+  organism      = "hsa",
+  keyType       = "ncbi-geneid",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH"
+)
+
+cat("Enriched KEGG pathways:", nrow(kk_ora@result[kk_ora@result$p.adjust < 0.05, ]),
+    "\n\n")
+head(kk_ora@result[, 1:7], 15)
+```
+
+```{r, fig.width=12, fig.height=7}
+barplot(kk_ora, showCategory = 20,
+        title = "KEGG pathways – ORA (COPD DEGs)")
+```
+
+```{r, fig.width=12, fig.height=7}
+dotplot(kk_ora, showCategory = 20, title = "KEGG dotplot")
+```
+
+```{r, fig.width=14, fig.height=8}
+kk_ora_sim <- pairwise_termsim(kk_ora)
+emapplot(kk_ora_sim, showCategory = 30) +
+  ggtitle("KEGG enrichment map")
+```
+
+```{r, fig.width=12, fig.height=8}
+heatplot(kk_ora, showCategory = 15) +
+  ggtitle("KEGG heatplot – gene–pathway membership")
+```
+
+### Reactome pathways
+
+```{r}
+rp_ora <- enrichPathway(
+  gene          = sig_entrez,
+  universe      = universe_entrez,
+  organism      = "human",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH",
+  readable      = TRUE
+)
+
+cat("Enriched Reactome pathways:",
+    nrow(rp_ora@result[rp_ora@result$p.adjust < 0.05, ]), "\n\n")
+head(rp_ora@result[, 1:7], 15)
+```
+
+```{r, fig.width=12, fig.height=7}
+if (nrow(rp_ora@result[rp_ora@result$p.adjust < 0.05, ]) > 0) {
+  barplot(rp_ora, showCategory = 20, title = "Reactome pathways – ORA")
+  dotplot(rp_ora, showCategory = 20, title = "Reactome dotplot")
+}
+```
+
+---
+
+## GSEA — Gene Set Enrichment Analysis
+
+GSEA does not require a binary DEG threshold. All quantified genes are ranked
+by log fold-change (COPD vs Control), and the algorithm tests whether members
+of a gene set cluster at the top (up in COPD) or bottom (down in COPD) of
+this ranking beyond what is expected by chance.
+
+This directly reproduces the paper's GSEA analysis (they used MSigDB v3.1;
+here we use the current KEGG and GO databases through clusterProfiler).
+
+The key output is the **Normalized Enrichment Score (NES)**:
+
+- **NES > 0** → gene set enriched at the top → genes are **up-regulated in COPD**
+- **NES < 0** → gene set enriched at the bottom → genes are **down-regulated in COPD**
+
+### GSEA — KEGG pathways
+
+```{r}
+set.seed(42)   # for reproducibility of permutation p-values
+kk_gsea <- gseKEGG(
+  geneList     = ranked_list,
+  organism     = "hsa",
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  verbose      = FALSE
+)
+
+cat("GSEA KEGG — enriched pathways:", nrow(kk_gsea@result), "\n\n")
+# Show top up- and down-regulated pathways
+res_kegg <- kk_gsea@result[order(kk_gsea@result$NES, decreasing = TRUE), ]
+cat("Top 10 pathways enriched in COPD (NES > 0):\n")
+print(head(res_kegg[res_kegg$NES > 0, c("Description","NES","p.adjust")], 10))
+cat("\nTop 10 pathways depleted in COPD (NES < 0):\n")
+print(head(res_kegg[res_kegg$NES < 0, c("Description","NES","p.adjust")], 10))
+```
+
+```{r, fig.width=14, fig.height=8}
+dotplot(kk_gsea, showCategory = 20, split = ".sign") +
+  facet_grid(. ~ .sign) +
+  ggtitle("KEGG GSEA – COPD vs Control")
+```
+
+```{r, fig.width=12, fig.height=7}
+ridgeplot(kk_gsea, showCategory = 20, label_format = 50) +
+  ggtitle("KEGG GSEA – logFC distribution per gene set")
+```
+
+```{r}
+# GSEA enrichment plot for the top down-regulated pathway
+# Oxidative phosphorylation is expected to be the most depleted (paper finding)
+oxphos_id <- res_kegg$ID[grepl("oxidative|phosphorylation|OXPHOS",
+                                res_kegg$Description,
+                                ignore.case = TRUE)][1]
+if (!is.na(oxphos_id)) {
+  gseaplot(kk_gsea, geneSetID = oxphos_id,
+           title = paste0("GSEA plot – ", oxphos_id,
+                          " (", res_kegg$Description[res_kegg$ID == oxphos_id][1], ")"))
+}
+```
+
+```{r}
+# GSEA enrichment plot for the top up-regulated pathway
+top_up_id <- res_kegg$ID[res_kegg$NES > 0][1]
+if (!is.na(top_up_id)) {
+  gseaplot(kk_gsea, geneSetID = top_up_id,
+           title = paste0("GSEA plot – ", top_up_id,
+                          " (", res_kegg$Description[res_kegg$ID == top_up_id][1], ")"))
+}
+```
+
+### GSEA — GO Biological Process
+
+```{r}
+set.seed(42)
+kkGO_gsea <- gseGO(
+  geneList      = ranked_list,
+  ont           = "BP",
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH",
+  verbose       = FALSE
+)
+
+cat("GSEA GO-BP — enriched terms:", nrow(kkGO_gsea@result), "\n\n")
+res_go <- kkGO_gsea@result[order(kkGO_gsea@result$NES, decreasing = TRUE), ]
+cat("Top 10 GO-BP terms enriched in COPD (NES > 0):\n")
+print(head(res_go[res_go$NES > 0, c("Description","NES","p.adjust")], 10))
+cat("\nTop 10 GO-BP terms depleted in COPD (NES < 0):\n")
+print(head(res_go[res_go$NES < 0, c("Description","NES","p.adjust")], 10))
+```
+
+```{r, fig.width=14, fig.height=8}
+dotplot(kkGO_gsea, showCategory = 20, split = ".sign") +
+  facet_grid(. ~ .sign) +
+  ggtitle("GO-BP GSEA – COPD vs Control")
+```
+
+```{r, fig.width=12, fig.height=7}
+ridgeplot(kkGO_gsea, showCategory = 20, label_format = 50) +
+  ggtitle("GO-BP GSEA – logFC distribution per gene set")
+```
+
+```{r}
+# Enrichment plot for oxidative phosphorylation (paper's top finding)
+oxphos_go <- res_go$ID[grepl("oxidative phosphorylation",
+                              res_go$Description,
+                              ignore.case = TRUE)][1]
+if (!is.na(oxphos_go)) {
+  gseaplot(kkGO_gsea, geneSetID = oxphos_go,
+           title = paste0("GSEA plot – ",
+                          res_go$Description[res_go$ID == oxphos_go][1]))
+}
+```
+
+```{r}
+# Enrichment plot for proteasome / protein catabolic process (paper's second finding)
+prot_go <- res_go$ID[grepl("proteaso|protein catabol|ubiquitin",
+                             res_go$Description,
+                             ignore.case = TRUE)][1]
+if (!is.na(prot_go)) {
+  gseaplot(kkGO_gsea, geneSetID = prot_go,
+           title = paste0("GSEA plot – ",
+                          res_go$Description[res_go$ID == prot_go][1]))
+}
+```
+
+---
+
+# New Package 1 — DESeq2
+
+## Why DESeq2?
+
+**DESeq2** (Love et al., 2014) is an alternative to edgeR for DE analysis of
+RNA-seq count data. Both packages use the negative binomial distribution, but
+they differ in how they estimate and stabilize the per-gene dispersion:
+
+| Feature | edgeR | DESeq2 |
+|---|---|---|
+| Dispersion model | Empirical Bayes, tagwise | Shrinkage via MAP estimation |
+| Normalization | TMM scaling factors | Median-of-ratios (size factors) |
+| Test | Likelihood Ratio Test (LRT) | Wald test (or LRT) |
+| Fold-change shrinkage | Optional (apeglm) | Built-in (lfcShrink) |
+
+Running both gives a robust cross-validation: genes identified as DE by both
+methods are far more likely to be genuine findings than those found by only one.
+
+```{r}
+# DESeq2 requires integer counts and a design DataFrame
+dds <- DESeqDataSetFromMatrix(
+  countData = round(raw_count),          # must be integers
+  colData   = DataFrame(group = group),
+  design    = ~ group
+)
+
+# Remove very low-count genes (pre-filter recommended by DESeq2 vignette)
+dds <- dds[rowSums(counts(dds)) >= 10, ]
+cat("Genes after pre-filter:", nrow(dds), "\n")
+```
+
+```{r}
+# Run the full DESeq2 pipeline:
+#   1. Estimate size factors (median-of-ratios normalization)
+#   2. Estimate dispersions with shrinkage
+#   3. Fit negative binomial GLM and Wald test
+dds <- DESeq(dds)
+
+cat("Size factors (first 6 samples):\n")
+print(round(sizeFactors(dds)[1:6], 4))
+```
+
+### DESeq2 dispersion plot
+
+DESeq2 estimates a per-gene dispersion (grey dots), fits a trend (red line),
+and then shrinks each gene's dispersion towards the trend (blue dots). Genes
+with very high dispersion relative to the trend are not shrunk (circled black
+dots — these are treated as outliers to avoid inflating false positives).
+
+```{r}
+plotDispEsts(dds,
+             main = "DESeq2 – Dispersion estimates (COPD vs Control)")
+```
+
+### DESeq2 results
+
+```{r}
+# Extract results: COPD vs Control
+# contrast = c("factor", "numerator", "denominator")
+res_deseq2 <- results(dds,
+                      contrast       = c("group", "COPD", "Control"),
+                      alpha          = 0.01,
+                      pAdjustMethod  = "BH")
+
+summary(res_deseq2)
+```
+
+```{r}
+# Apply log fold-change shrinkage (apeglm) for better effect size estimates
+# This reduces noise for low-count genes without changing significance calls
+res_deseq2_shrunk <- lfcShrink(dds,
+                                coef    = "group_COPD_vs_Control",
+                                type    = "apeglm",
+                                res     = res_deseq2)
+```
+
+```{r}
+# Convert to data frame and filter to DEGs
+tab_deseq2 <- as.data.frame(res_deseq2_shrunk)
+tab_deseq2$gene <- rownames(tab_deseq2)
+tab_deseq2 <- tab_deseq2[!is.na(tab_deseq2$padj), ]
+
+de_deseq2 <- tab_deseq2[tab_deseq2$padj < 0.01, ]
+cat("DEGs at FDR < 0.01 (DESeq2):", nrow(de_deseq2), "\n")
+cat("  Up-regulated in COPD:", sum(de_deseq2$log2FoldChange > 0), "\n")
+cat("  Down-regulated in COPD:", sum(de_deseq2$log2FoldChange < 0), "\n")
+```
+
+### DESeq2 MA plot
+
+The MA plot (built-in to DESeq2) shows the shrunken log fold-changes vs mean
+expression. Grey points = not significant; blue points = significant DEGs.
+The fold-change shrinkage pulls low-count genes' extreme estimates towards
+zero, making the plot more informative than an unshrunken version.
+
+```{r}
+plotMA(res_deseq2_shrunk,
+       alpha = 0.01,
+       main  = "DESeq2 MA plot – COPD vs Control (shrunken LFC)",
+       ylim  = c(-4, 4))
+```
+
+### DESeq2 volcano plot
+
+```{r, fig.width=10, fig.height=8}
+tab_deseq2$direction <- "NS"
+tab_deseq2$direction[tab_deseq2$padj < 0.01 &
+                     tab_deseq2$log2FoldChange > 0] <- "Up (COPD)"
+tab_deseq2$direction[tab_deseq2$padj < 0.01 &
+                     tab_deseq2$log2FoldChange < 0] <- "Down (COPD)"
+
+tab_deseq2$symbol <- annot_sub$symbol[match(tab_deseq2$gene,
+                                             rownames(raw_count))]
+top_label_d2 <- head(tab_deseq2[order(tab_deseq2$padj, na.last = TRUE), ], 25)
+
+ggplot(tab_deseq2, aes(log2FoldChange, -log10(pvalue), colour = direction)) +
+  geom_point(size = 0.8, alpha = 0.6) +
+  scale_colour_manual(values = c("Up (COPD)"   = "#E05C5C",
+                                 "Down (COPD)" = "#5B8DB8",
+                                 "NS"          = "grey70")) +
+  geom_text_repel(data = top_label_d2,
+                  aes(label = symbol),
+                  size = 2.5, max.overlaps = 25, colour = "black") +
+  geom_vline(xintercept = c(-1, 1), lty = 2, colour = "grey40") +
+  labs(title  = "Volcano plot – DESeq2 (COPD vs Control)",
+       x      = expression(log[2]~Fold~Change~(shrunken)),
+       y      = expression(-log[10]~p-value),
+       colour = "Direction") +
+  theme_classic(base_size = 13)
+```
+
+### Three-way DEG overlap
+
+```{r}
+# Genes called DE by all three methods
+overlap_all3 <- Reduce(intersect, list(de_edger$gene,
+                                       de_ttest$gene,
+                                       de_deseq2$gene))
+cat("DEGs found by ALL THREE methods:", length(overlap_all3), "\n")
+cat("  edgeR only:", sum(!de_edger$gene  %in% union(de_ttest$gene, de_deseq2$gene)), "\n")
+cat("  DESeq2 only:", sum(!de_deseq2$gene %in% union(de_ttest$gene, de_edger$gene)), "\n")
+cat("  t-test only:", sum(!de_ttest$gene  %in% union(de_edger$gene, de_deseq2$gene)), "\n")
+cat("  edgeR ∩ DESeq2:", length(intersect(de_edger$gene, de_deseq2$gene)), "\n")
+```
+
+> Genes in the three-way intersection are the most robust DEG candidates —
+> they survive all three different statistical frameworks.
+
+---
+
+# New Package 2 — NOISeq
+
+## Why NOISeq?
+
+**NOISeq** (Tarazona et al., 2011; updated 2015) takes a fundamentally
+different approach to DE analysis compared to edgeR and DESeq2:
+
+- **No distributional assumption** — it is non-parametric and does not assume
+  that counts follow a negative binomial (or any other) distribution
+- **Noise model** — it estimates the noise distribution empirically by
+  comparing all pairs of samples *within* the same condition, then assesses
+  whether the observed fold-change between conditions exceeds this noise level
+- **Probability-based output** — instead of a p-value, each gene gets a
+  probability $q$ that its expression change is genuine signal rather than
+  noise; $q \geq 0.8$ is the recommended threshold (equivalent to a 20% FDR)
+
+This makes NOISeq particularly valuable when the NB assumptions of edgeR/DESeq2
+may be questionable, and as an independent cross-validation strategy.
+
+### NOISeq method options
+
+| Mode | When to use |
+|---|---|
+| `noiseq` | Biological replicates available (our case — 91 controls, 98 COPD) |
+| `noiseqbio` | Optimized for biological replicates with technical variance estimation |
+
+We use **`noiseqbio`** because we have biological replicates and want the most
+robust estimates.
+
+```{r}
+# NOISeq requires a NOISeq-format data object
+# Build factor data frame for sample groups
+sample_factors <- data.frame(
+  group = factor(group, levels = c("Control", "COPD")),
+  row.names = colnames(raw_count)
+)
+
+# Create NOISeq data object
+# We supply the raw counts and the sample annotation
+# Gene length (for within-sample normalization) is taken from annot_sub
+gene_lengths_noiSeq <- rowData(se)$length
+names(gene_lengths_noiSeq) <- rownames(raw_count)
+
+noiseq_data <- readData(
+  data        = raw_count,
+  factors     = sample_factors,
+  length      = gene_lengths_noiSeq   # used for RPKM within-sample normalization
+)
+
+cat("NOISeq data object created.\n")
+print(noiseq_data)
+```
+
+```{r}
+# Run noiseqbio
+# norm = "rpkm": within-sample normalization (corrects gene length + depth)
+#         equivalent to FPKM for single-end; matches paper's within-sample step
+# k = 0.5: pseudocount to handle zeros
+# nclust = 15: number of clusters for noise estimation
+# r = 20: number of simulations
+set.seed(42)
+noiseq_res <- noiseqbio(
+  input   = noiseq_data,
+  norm    = "rpkm",
+  factor  = "group",
+  conditions = list(Control = which(group == "Control"),
+                    COPD    = which(group == "COPD")),
+  k       = 0.5,
+  nclust  = 15,
+  r       = 20,
+  plot    = FALSE
+)
+
+cat("NOISeq analysis complete.\n")
+```
+
+```{r}
+# Extract results
+tab_noiSeq <- noiseq_res@results[[1]]
+tab_noiSeq$gene <- rownames(tab_noiSeq)
+
+# NOISeq uses probability q: q >= 0.8 corresponds to ~80% posterior probability
+# of being genuinely differentially expressed (equivalent to FDR ~ 0.2)
+# For a stricter threshold matching the paper, use q >= 0.9 (~FDR ~ 0.1)
+de_noiSeq_08 <- tab_noiSeq[!is.na(tab_noiSeq$prob) & tab_noiSeq$prob >= 0.8, ]
+de_noiSeq_09 <- tab_noiSeq[!is.na(tab_noiSeq$prob) & tab_noiSeq$prob >= 0.9, ]
+
+cat("NOISeq DEGs at q >= 0.8 (~FDR 20%):", nrow(de_noiSeq_08), "\n")
+cat("NOISeq DEGs at q >= 0.9 (~FDR 10%):", nrow(de_noiSeq_09), "\n")
+cat("  Up-regulated in COPD (q >= 0.8):",
+    sum(de_noiSeq_08$log2FC > 0, na.rm = TRUE), "\n")
+cat("  Down-regulated in COPD (q >= 0.8):",
+    sum(de_noiSeq_08$log2FC < 0, na.rm = TRUE), "\n")
+```
+
+### NOISeq probability plot
+
+The NOISeq probability plot shows each gene's differential expression
+probability ($q$) on the y-axis against its mean expression on the x-axis.
+Genes with high $q$ (above the dashed line at 0.8) are called DE; the colour
+indicates fold-change direction.
+
+```{r}
+DE.plot(noiseq_res,
+        q    = 0.8,
+        graphic = "expr",
+        main = "NOISeq – Differential expression probability plot")
+```
+
+```{r}
+# MD-style plot from NOISeq
+DE.plot(noiseq_res,
+        q    = 0.8,
+        graphic = "MD",
+        main = "NOISeq – MD plot (M = log2FC, D = mean expression)")
+```
+
+### NOISeq volcano-style plot
+
+```{r, fig.width=10, fig.height=7}
+tab_noiSeq$direction <- "NS"
+tab_noiSeq$direction[!is.na(tab_noiSeq$prob) &
+                     tab_noiSeq$prob >= 0.8 &
+                     tab_noiSeq$log2FC > 0] <- "Up (COPD)"
+tab_noiSeq$direction[!is.na(tab_noiSeq$prob) &
+                     tab_noiSeq$prob >= 0.8 &
+                     tab_noiSeq$log2FC < 0] <- "Down (COPD)"
+
+tab_noiSeq$symbol <- annot_sub$symbol[match(tab_noiSeq$gene,
+                                             rownames(raw_count))]
+
+ggplot(tab_noiSeq[!is.na(tab_noiSeq$prob), ],
+       aes(log2FC, prob, colour = direction)) +
+  geom_point(size = 0.8, alpha = 0.6) +
+  scale_colour_manual(values = c("Up (COPD)"   = "#E05C5C",
+                                 "Down (COPD)" = "#5B8DB8",
+                                 "NS"          = "grey70")) +
+  geom_hline(yintercept = 0.8, lty = 2, colour = "grey40") +
+  geom_vline(xintercept = c(-1, 1), lty = 2, colour = "grey40") +
+  labs(title  = "NOISeq – Probability vs log2FC (COPD vs Control)",
+       x      = expression(log[2]~Fold~Change),
+       y      = "NOISeq probability (q)",
+       colour = "Direction") +
+  theme_classic(base_size = 13)
+```
+
+### Four-method DEG overlap
+
+```{r}
+# Consensus DEGs — found by at least 3 out of 4 methods
+all_methods <- list(
+  ttest   = de_ttest$gene,
+  edgeR   = de_edger$gene,
+  DESeq2  = de_deseq2$gene,
+  NOISeq  = de_noiSeq_08$gene
+)
+
+# Count how many methods call each gene as DE
+all_genes <- unique(unlist(all_methods))
+method_counts <- sapply(all_genes, function(g) {
+  sum(sapply(all_methods, function(m) g %in% m))
+})
+
+cat("DEGs by number of methods agreeing:\n")
+print(table(method_counts))
+
+# Consensus: called DE by >= 3 methods
+consensus_degs <- names(method_counts)[method_counts >= 3]
+cat("\nConsensus DEGs (≥ 3/4 methods agree):", length(consensus_degs), "\n")
+```
+
+```{r, fig.width=8, fig.height=5}
+# Barplot of agreement
+barplot(table(method_counts),
+        col   = c("grey80", "#A8C8E8", "#5B8DB8", "#1B4F72"),
+        xlab  = "Number of methods agreeing",
+        ylab  = "Number of genes",
+        main  = "Method agreement across 4 DE approaches",
+        names.arg = paste0(names(table(method_counts)), " method(s)"))
+```
+
+> Genes called DE by **all four methods** represent the most conservative and
+> robust set of DEGs — they are detected regardless of the statistical
+> framework or normalization strategy used.
+
+---
+
+# Comparison with Paper Findings
+
+The paper reported the following key results. Use this table to check whether
+your results reproduce them.
+
+| Paper finding | Paper result | Your result |
+|---|---|---|
+| Total DEGs (q < 0.01) | **2,312** | Check `nrow(de_ttest)` |
+| edgeR DEGs (FDR < 0.01) | — | Check `nrow(de_edger)` |
+| DESeq2 DEGs (FDR < 0.01) | — | Check `nrow(de_deseq2)` |
+| NOISeq DEGs (q ≥ 0.8) | — | Check `nrow(de_noiSeq_08)` |
+| Consensus DEGs (≥ 3/4 methods) | — | Check `length(consensus_degs)` |
+| Top down-regulated pathway | **Oxidative phosphorylation** | Check GSEA NES < 0 |
+| Top down-regulated process | **Protein catabolism / proteasome** | Check GSEA NES < 0 |
+| Up-regulated process | **Chromatin modification** | Check GSEA NES > 0 |
+| Up-regulated complex | **Ribonucleoprotein complex** | Check GO-CC / GO-BP |
+
+> **Note on DEG count differences**: The paper computed FPKM using Cufflinks
+> (which uses effective transcript lengths and alignment-aware quantification)
+> while our FPKM uses genomic gene lengths from the annotation. Small
+> differences in the DEG count are expected. The pathway-level conclusions
+> should be robust.
+
+---
+
+# Discussion Questions
+
+**Q1.** The paper used a Student's t-test on normalized values, while we also
+ran edgeR, DESeq2, and NOISeq on raw counts. What is the key statistical
+reason why count-based models are more appropriate than t-tests for RNA-seq
+data?
+
+**Q2.** edgeR and DESeq2 both use the negative binomial distribution but
+estimate dispersion differently. Looking at the BCV plot (edgeR) and the
+dispersion plot (DESeq2), how does each method handle genes with unreliable
+dispersion estimates?
+
+**Q3.** NOISeq uses a probability $q$ rather than a p-value. What does
+$q \geq 0.8$ mean in terms of the noise model, and why is this approach
+advantageous when the NB distributional assumption may not hold?
+
+**Q4.** Looking at the four-method overlap barplot, how many genes are called
+DE by all four methods? What does a large number of "1 method only" genes
+tell you about the sensitivity vs specificity trade-off between the methods?
+
+**Q5.** Looking at the p-value histogram, does the distribution look as
+expected for a dataset with genuine differential expression? What would it
+look like if there were no true signal?
+
+**Q6.** The GSEA results rank pathways by their NES. Why is the NES more
+informative than a raw enrichment score when comparing pathways of different
+sizes?
+
+**Q7.** The paper found oxidative phosphorylation to be the most
+down-regulated pathway in COPD. Does your GSEA reproduce this finding? Is it
+consistent across the ORA results as well?
+
+---
+
+# Save data for next tutorial
+
+```{r}
+save(list = c("tab_edger",   "tab_ttest",   "tab_deseq2",  "tab_noiSeq",
+              "de_edger",    "de_ttest",    "de_deseq2",   "de_noiSeq_08",
+              "consensus_degs",
+              "sig_entrez", "universe_entrez",
+              "ranked_list",
+              "kk_gsea", "kkGO_gsea",
+              "kk_ora", "ego_BP", "rp_ora",
+              "group", "sample_meta"),
+     file = "DEG.RData")
+
+cat("Saved DEG.RData\n")
+cat("  de_ttest      – DEGs by paper method (t-test, FDR < 0.01)\n")
+cat("  de_edger      – DEGs by edgeR GLM (FDR < 0.01)\n")
+cat("  de_deseq2     – DEGs by DESeq2 (FDR < 0.01, shrunken LFC)\n")
+cat("  de_noiSeq_08  – DEGs by NOISeq (q >= 0.8)\n")
+cat("  consensus_degs – DEGs called by >= 3/4 methods\n")
+cat("  kk_gsea       – GSEA KEGG results\n")
+cat("  kkGO_gsea     – GSEA GO-BP results\n")
+```
+
+---
+
+# Session Information
+
+```{r}
+sessionInfo()
+```
