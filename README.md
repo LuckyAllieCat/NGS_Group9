@@ -18,9 +18,14 @@ Download data:  https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE57148
 Biological Problem:  Unclear mapping of molecular pathways in the COPD dysregulation.  
 
 To-do:
+
 Look over rought draft of code and workflow pipeline - NG
+
 Get started on Report - AW (will update once done)
+
 Review Report - NG
+
 Consolidate on May 18th 
+
 Aim to submit May 19th
 
